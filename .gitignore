@@ -33,3 +33,6 @@ trainv2_whitelist/
 mzone-ai/
 secrets.toml
 haslibb.py
+train.jsonl
+test.jsonl
+val.jsonl

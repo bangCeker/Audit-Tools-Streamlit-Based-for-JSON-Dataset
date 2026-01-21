@@ -12,9 +12,7 @@ import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 
-# =====================
-# LABEL SPACE (EDIT DI SINI)
-# =====================
+
 INTENT = ["SOS", "SOS_POSSIBLE", "NON_SOS"]
 URGENCY = ["HIGH", "MEDIUM", "LOW"]
 EVENTS = [
@@ -28,9 +26,6 @@ EVENTS = [
     "SECURITY_ASSAULT",
 ]
 
-# =====================
-# RULES (triage / flag) — tidak auto-ubah, hanya kasih "reason + suggestion"
-# =====================
 RULES = [
     {
         "name": "kw_collision_missing_event",
@@ -97,17 +92,13 @@ RULES = [
     },
 ]
 
-# event berat → biasanya butuh urgency min tertentu
 HEAVY_EVENTS_MIN_URGENCY = {
     "FIRE_EXPLOSION": "HIGH",
     "HAZMAT_RELEASE": "HIGH",
-    "INJURY_MEDICAL": "HIGH",  # bisa kamu naikkan ke HIGH kalau mau
+    "INJURY_MEDICAL": "HIGH", 
     "COLLISION_VEHICLE": "HIGH",
 }
 
-# =====================
-# Utils
-# =====================
 def normalize_text(t: str) -> str:
     t = t or ""
     t = unicodedata.normalize("NFKC", t)
@@ -119,18 +110,15 @@ def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 def order_rank(label: str, space: list) -> int:
-    # semakin kecil semakin "tinggi prioritas"
     try:
         return space.index(label)
     except ValueError:
         return 10**9
 
 def max_severity(a: str, b: str, space: list) -> str:
-    # pilih yang lebih "tinggi"
     return a if order_rank(a, space) < order_rank(b, space) else b
 
 def min_required(label: str, min_label: str, space: list) -> bool:
-    # True kalau label sudah >= min_label (dalam severity)
     return order_rank(label, space) <= order_rank(min_label, space)
 
 def safe_list(x):
@@ -202,12 +190,10 @@ def suggest_from_rules(text_norm: str, cur_intent: str, cur_urg: str, cur_events
         reasons.append(rule["name"])
         hits.append(rule["regex"])
 
-        # suggest events if missing
         for e in rule.get("suggest_events", []):
             if e not in cur_events_set:
                 sug_events.add(e)
 
-        # suggest intent/urgency min
         min_it = rule.get("min_intent")
         if min_it and cur_intent in INTENT:
             if not min_required(cur_intent, min_it, INTENT):
@@ -218,7 +204,6 @@ def suggest_from_rules(text_norm: str, cur_intent: str, cur_urg: str, cur_events
             if not min_required(cur_urg, min_urg, URGENCY):
                 sug_urg = max_severity(sug_urg or cur_urg, min_urg, URGENCY)
 
-    # heavy event → urgency min
     for e in cur_events_set:
         min_urg = HEAVY_EVENTS_MIN_URGENCY.get(e)
         if min_urg and cur_urg in URGENCY:
@@ -226,9 +211,7 @@ def suggest_from_rules(text_norm: str, cur_intent: str, cur_urg: str, cur_events
                 reasons.append(f"heavy_event_low_urgency:{e}")
                 sug_urg = max_severity(sug_urg or cur_urg, min_urg, URGENCY)
 
-    # emergency-ish intent rules
     if cur_intent == "NON_SOS":
-        # kalau ada heavy event tapi NON_SOS → flag
         if any(e in {"FIRE_EXPLOSION", "HAZMAT_RELEASE", "INJURY_MEDICAL", "TRAPPED_LOST"} for e in cur_events_set):
             reasons.append("non_sos_with_heavy_event")
             sug_intent = "SOS_POSSIBLE"
@@ -253,7 +236,6 @@ def main():
             if t:
                 val_hashes.add(sha1_hex(t))
 
-    # duplicates inside file
     hash_to_idxs = defaultdict(list)
     for r in rows:
         t = normalize_text(r.get("text", ""))
@@ -300,7 +282,7 @@ def main():
         sug_urg = None
         sug_events = []
 
-        # basic invalid label flags
+        # basic invalid label flag
         if problems:
             reasons.extend([f"data_problem:{p}" for p in problems])
 

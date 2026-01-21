@@ -31,3 +31,5 @@ trainv1/
 trainv2_whitelist/
 /development/**
 mzone-ai/
+secrets.toml
+haslibb.py

@@ -2,15 +2,18 @@
 import json
 import os
 import re
+import math
 import hashlib
+import hmac
 import unicodedata
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-import hashlib
-import hmac
 
+# =====================
+# LABEL SPACE (HARUS sama dengan training)
+# =====================
 INTENT = ["SOS", "SOS_POSSIBLE", "NON_SOS"]
 URGENCY = ["HIGH", "MEDIUM", "LOW"]
 EVENTS = [
@@ -24,6 +27,7 @@ EVENTS = [
     "SECURITY_ASSAULT",
 ]
 
+# highlight keyword (visual doang)
 HILITE_PATTERNS = [
     r"\b(tabrak|menabrak|tabrakan|tertabrak|nabrak|bentur|ketabrak|collision)\b",
     r"\b(berdarah|luka|patah|cedera|trauma|memar|pingsan)\b",
@@ -35,6 +39,9 @@ HILITE_PATTERNS = [
     r"\b(emergency|darurat|tolong|urgent|segera)\b",
 ]
 
+# =====================
+# Utils
+# =====================
 def normalize_text(t: str) -> str:
     t = t or ""
     t = unicodedata.normalize("NFKC", t).lower().strip()
@@ -73,14 +80,9 @@ def highlight_text(text: str):
         out = re.sub(pat, lambda m: f"<mark>{m.group(0)}</mark>", out, flags=re.I)
     return out
 
-def go_next():
-    st.session_state.cursor = min(st.session_state.cursor + 1, len(item_ids) - 1)
-    st.session_state.edit_note = ""
-
-def go_prev():
-    st.session_state.cursor = max(st.session_state.cursor - 1, 0)
-    st.session_state.edit_note = ""
-    
+# =====================
+# Cache Loaders
+# =====================
 @st.cache_data(show_spinner=False)
 def load_jsonl_cached(path: str):
     rows = []
@@ -137,9 +139,9 @@ def write_jsonl(path: str, rows: list):
             rr["events"] = stable_events(rr.get("events", []))
             f.write(json.dumps(rr, ensure_ascii=False) + "\n")
 
-st.set_page_config(page_title="MZone Dataset Review", layout="wide")
-st.title("MZone Dataset Review — Mode: Batch Editor / Single Review")
-
+# =====================
+# Auth
+# =====================
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -153,9 +155,7 @@ def require_login():
     APP_PASS_SHA256 = st.secrets.get("APP_PASS_SHA256", "")
 
     if not APP_SALT or not APP_PASS_SHA256:
-        st.error(
-            "Secrets belum diisi. Buat .streamlit/secrets.toml dengan APP_USER, APP_SALT, APP_PASS_SHA256."
-        )
+        st.error("Secrets belum diisi. Buat .streamlit/secrets.toml dengan APP_USER, APP_SALT, APP_PASS_SHA256.")
         st.stop()
 
     if "auth_ok" not in st.session_state:
@@ -173,7 +173,6 @@ def require_login():
     st.caption("Masukkan username & password untuk mengakses tool review dataset.")
     u = st.text_input("Username", value="", autocomplete="username")
     p = st.text_input("Password", value="", type="password", autocomplete="current-password")
-
     c1, c2 = st.columns([1, 3])
     do_login = c1.button("Login", use_container_width=True)
 
@@ -181,17 +180,181 @@ def require_login():
         ok_user = (u.strip() == APP_USER)
         calc = _sha256_hex((APP_SALT + (p or "")).strip())
         ok_pass = hmac.compare_digest(calc, APP_PASS_SHA256)
-
         if ok_user and ok_pass:
             st.session_state.auth_ok = True
             st.rerun()
         else:
             st.error("Username / password salah.")
-
     st.stop()
+
+# =====================
+# Persist State (jobs/progress)
+# =====================
+def dataset_sig_nojob(ids: list) -> str:
+    """signature dataset, tidak tergantung job_size"""
+    if not ids:
+        return sha1_hex("dataset|0")
+    mid = ids[len(ids)//2]
+    s = f"dataset|{len(ids)}|{ids[0]}|{mid}|{ids[-1]}"
+    return sha1_hex(s)
+
+def job_sig(ids: list, job_size: int) -> str:
+    """signature jobs, tergantung job_size"""
+    if not ids:
+        return sha1_hex(f"job|{job_size}|0")
+    mid = ids[len(ids)//2]
+    s = f"job|{job_size}|{len(ids)}|{ids[0]}|{mid}|{ids[-1]}"
+    return sha1_hex(s)
+
+def get_state_path(data_path: str, job_size: int) -> str:
+    base = os.path.dirname(data_path) or "."
+    js = int(job_size)
+    return os.path.join(base, f"review_state_jobs_{js}.json")
+
+def _atomic_write_json(path: str, obj: dict):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def load_state_if_any(state_path: str, cur_dataset_sig: str, cur_job_sig: str):
+    """load reviewed_ids selalu (kalau dataset match). load jobs/accepted hanya kalau job_sig match."""
+    if not os.path.exists(state_path):
+        return
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        return
+
+    if state.get("dataset_sig") != cur_dataset_sig:
+        return
+
+    # reviewed_ids global
+    reviewed = state.get("reviewed_ids", [])
+    st.session_state.reviewed_ids = set(map(str, reviewed))
+
+    # jobs only if job_sig matches
+    if state.get("job_sig") == cur_job_sig:
+        if isinstance(state.get("jobs"), list):
+            st.session_state.jobs = state["jobs"]
+        st.session_state.active_job_no = state.get("active_job_no")
+        st.session_state.jobs_page = int(state.get("jobs_page", 0) or 0)
+        st.session_state.cursor = int(state.get("cursor", 0) or 0)
+        st.session_state.page = int(state.get("page", 0) or 0)
+
+def persist_state_now(state_path: str, cur_dataset_sig: str, cur_job_sig: str):
+    reviewed_ids = sorted(list(st.session_state.get("reviewed_ids", set())))
+    state = {
+        "version": 1,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset_path": st.session_state.get("dataset_path", ""),
+        "dataset_sig": cur_dataset_sig,
+        "job_sig": cur_job_sig,
+        "reviewed_ids": reviewed_ids,
+        "jobs": st.session_state.get("jobs", []),
+        "active_job_no": st.session_state.get("active_job_no"),
+        "jobs_page": st.session_state.get("jobs_page", 0),
+        "cursor": st.session_state.get("cursor", 0),
+        "page": st.session_state.get("page", 0),
+    }
+    _atomic_write_json(state_path, state)
+
+def reset_state(state_path: str, cur_dataset_sig: str, cur_job_sig: str):
+    st.session_state.reviewed_ids = set()
+    st.session_state.history = []
+    # reset accepted
+    jobs = st.session_state.get("jobs", [])
+    for j in jobs:
+        j["accepted"] = None
+    st.session_state.jobs = jobs
+    st.session_state.active_job_no = None
+    st.session_state.jobs_page = 0
+    st.session_state.cursor = 0
+    st.session_state.page = 0
+    persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+
+# =====================
+# Job System
+# =====================
+def ensure_jobs(ids: list, job_size: int):
+    sig = job_sig(ids, job_size)
+    if st.session_state.get("jobs_sig_runtime") != sig:
+        jobs = []
+        n = len(ids)
+        step = int(job_size)
+        for k in range(0, n, step):
+            jobs.append({
+                "job_no": (k // step) + 1,
+                "start": k,
+                "end": min(k + step, n),
+                "accepted": None,
+            })
+        st.session_state.jobs = jobs
+        st.session_state.jobs_sig_runtime = sig
+        st.session_state.active_job_no = None
+        st.session_state.jobs_page = 0
+
+def get_active_ids(all_ids: list):
+    job_no = st.session_state.get("active_job_no")
+    if not job_no:
+        return all_ids
+    jobs = st.session_state.get("jobs", [])
+    j = next((x for x in jobs if x["job_no"] == job_no), None)
+    if not j:
+        return all_ids
+    return all_ids[j["start"]:j["end"]]
+
+def mark_reviewed(cur_id: str):
+    if "reviewed_ids" not in st.session_state:
+        st.session_state.reviewed_ids = set()
+    st.session_state.reviewed_ids.add(str(cur_id))
+
+def job_progress(job, all_ids: list):
+    reviewed = st.session_state.get("reviewed_ids", set())
+    seg = all_ids[job["start"]:job["end"]]
+    done = sum(1 for cid in seg if cid in reviewed)
+    total = len(seg)
+    pct = (done / total) if total else 0.0
+    return done, total, pct
+
+def open_job(job_no: int, all_ids: list):
+    st.session_state.active_job_no = job_no
+
+    jobs = st.session_state.get("jobs", [])
+    j = next((x for x in jobs if x["job_no"] == job_no), None)
+    if not j:
+        st.session_state.cursor = 0
+        st.session_state._cur_loaded_id = None
+        st.session_state.work_view = "Single Review"
+        return
+
+    reviewed = st.session_state.get("reviewed_ids", set())
+    seg = all_ids[j["start"]:j["end"]]
+
+    idx = 0
+    for i, cid in enumerate(seg):
+        if cid not in reviewed:
+            idx = i
+            break
+    else:
+        idx = max(0, len(seg) - 1)
+
+    st.session_state.cursor = idx
+    st.session_state._cur_loaded_id = None
+    st.session_state.work_view = "Single Review"
+
+# =====================
+# App UI
+# =====================
+st.set_page_config(page_title="MZone Dataset Review", layout="wide")
+st.title("MZone Dataset Review — Jobs / Single / Batch")
 
 require_login()
 
+# ---- Sidebar: paths dulu
 with st.sidebar:
     st.header("Paths")
     data_path = st.text_input(
@@ -213,11 +376,28 @@ with st.sidebar:
 
     st.divider()
     st.header("Audit Source Mode")
-    mode = st.radio("Pilih source", ["Queue Review", "Search/Filter"], index=0)
+    mode = st.radio(
+        "Pilih source",
+        ["Direct Review (No audit)", "Search/Filter", "Queue Review (optional)"],
+        index=0
+    )
 
     st.divider()
-    st.header("Review UI Mode")
-    review_ui = st.radio("Pilih tampilan", ["Batch Editor", "Single Review"], index=1)
+    st.header("Workspace")
+    work_view = st.radio(
+        "Pilih halaman",
+        ["Jobs", "Single Review", "Batch Editor"],
+        index=0,
+        key="work_view"
+    )
+
+    st.divider()
+    st.header("Job Split")
+    job_size = st.selectbox("Ukuran job", [100, 200, 500, 1000, 2000], index=0)
+    st.caption("Dataset dibagi job berurutan (tanpa shuffle).")
+
+    st.divider()
+    st.header("Batch Editor")
     batch_size = st.slider("Batch size (Batch Editor)", 10, 100, 25, 5)
 
     st.divider()
@@ -226,34 +406,45 @@ with st.sidebar:
     show_only_with_suggestions = st.checkbox("Hanya yang ada suggestion", value=False)
 
     st.divider()
-    st.header("Search/Filter (kalau mode Search/Filter)")
+    st.header("Search/Filter")
     f_keyword = st.text_input("Keyword/regex", value="")
     f_event = st.selectbox("Event", ["(any)"] + EVENTS, index=0)
     f_urg = st.selectbox("Urgency", ["(any)"] + URGENCY, index=0)
     f_int = st.selectbox("Intent", ["(any)"] + INTENT, index=0)
 
-
+# =====================
+# Load dataset into session_state
+# =====================
 if not data_path or not os.path.exists(data_path):
     st.error("Dataset path tidak valid / file tidak ditemukan.")
     st.stop()
 
 if st.session_state.get("dataset_path") != data_path:
     raw_rows, raw_id2pos = load_jsonl_cached(data_path)
-    rows = [dict(r) for r in raw_rows]
-    id2pos = dict(raw_id2pos)
-
     st.session_state.dataset_path = data_path
-    st.session_state.rows = rows
-    st.session_state.id2pos = id2pos
+    st.session_state.rows = [dict(r) for r in raw_rows]
+    st.session_state.id2pos = dict(raw_id2pos)
+
     st.session_state.history = []
     st.session_state.cursor = 0
     st.session_state.page = 0
     st.session_state._cur_loaded_id = None
 
+    st.session_state.reviewed_ids = set()
+    st.session_state.jobs_sig_runtime = None
+    st.session_state.active_job_no = None
+    st.session_state.jobs = []
+    st.session_state.jobs_page = 0
+
+    # mark state loaded flag reset
+    st.session_state._persist_loaded_for = None
+
 rows = st.session_state.rows
 id2pos = st.session_state.id2pos
 
-
+# =====================
+# Build item list (Direct / Search / Queue)
+# =====================
 queue_df = None
 item_ids = []
 
@@ -265,10 +456,14 @@ def get_queue_row(cur_id: str):
         return None
     return q.iloc[0].to_dict()
 
-if mode == "Queue Review":
+if mode == "Direct Review (No audit)":
+    item_ids = [r["_id"] for r in rows]
+
+elif mode == "Queue Review (optional)":
     if queue_path and os.path.exists(queue_path):
         base_df = load_queue_csv_cached(queue_path)
         df = base_df.copy()
+
         if reason_filter.strip():
             df = df[df["reasons"].astype(str).str.contains(reason_filter.strip(), case=False, na=False)]
         if show_only_with_suggestions:
@@ -277,13 +472,20 @@ if mode == "Queue Review":
                 | (df["suggest_urgency"].astype(str).str.len() > 0)
                 | (df["suggest_events"].astype(str).str.len() > 0)
             ]
+
         item_ids = [str(x) for x in df["id"].tolist() if str(x) in id2pos]
         queue_df = df.reset_index(drop=True)
-    else:
-        st.warning("Queue CSV tidak ditemukan. Jalankan audit_queue.py dulu atau gunakan mode Search/Filter.")
-        mode = "Search/Filter"
 
-if mode == "Search/Filter":
+        if not item_ids:
+            st.warning("Queue kosong setelah filter. Fallback ke Direct Review.")
+            item_ids = [r["_id"] for r in rows]
+            queue_df = None
+    else:
+        st.warning("Queue CSV tidak ditemukan. Fallback ke Direct Review.")
+        item_ids = [r["_id"] for r in rows]
+        queue_df = None
+
+elif mode == "Search/Filter":
     kw = f_keyword.strip()
     pat = None
     if kw:
@@ -309,7 +511,46 @@ if not item_ids:
     st.info("Tidak ada item untuk direview (cek mode/filters).")
     st.stop()
 
+# =====================
+# Jobs + Active IDs + Persist load
+# =====================
+ensure_jobs(item_ids, job_size)
+active_ids = get_active_ids(item_ids)
 
+cur_dataset_sig = dataset_sig_nojob([r["_id"] for r in rows])
+cur_job_sig = job_sig(item_ids, job_size)
+state_path = get_state_path(data_path, job_size)
+
+# load persisted state ONCE per dataset+jobsig setup
+persist_key = f"{state_path}|{cur_dataset_sig}|{cur_job_sig}"
+if st.session_state.get("_persist_loaded_for") != persist_key:
+    load_state_if_any(state_path, cur_dataset_sig, cur_job_sig)
+    st.session_state._persist_loaded_for = persist_key
+
+# sidebar persist controls (setelah state_path ketemu)
+with st.sidebar:
+    st.divider()
+    st.header("Persist State")
+    st.caption(f"State file (job_size={job_size}): `{state_path}`")
+
+
+    cS1, cS2 = st.columns(2)
+    if cS1.button("💾 Save state", use_container_width=True):
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+        st.success("State saved.")
+    if cS2.button("♻ Reset state", use_container_width=True):
+        reset_state(state_path, cur_dataset_sig, cur_job_sig)
+        st.warning("State reset.")
+        st.rerun()
+
+# clamp cursor
+if "cursor" not in st.session_state:
+    st.session_state.cursor = 0
+st.session_state.cursor = max(0, min(st.session_state.cursor, len(active_ids) - 1))
+
+# =====================
+# Shared actions
+# =====================
 def stable_row_events(row_dict):
     return stable_events(row_dict.get("events", []))
 
@@ -320,8 +561,8 @@ def save_change(cur_id: str, new_intent: str, new_urg: str, new_events: list, no
     old_intent = r.get("intent", "")
     old_urg = r.get("urgency", "")
     old_ev = stable_row_events(r)
-
     new_ev = stable_events(new_events)
+
     changed = (old_intent != new_intent) or (old_urg != new_urg) or (old_ev != new_ev)
     if not changed:
         return False
@@ -361,15 +602,93 @@ def undo_last():
     rows[pos]["events"] = last["old_events"]
     return True
 
+# =====================
+# JOBS BOARD
+# =====================
+if work_view == "Jobs":
+    st.subheader("Job Board (klik job untuk mulai review)")
 
-if review_ui == "Batch Editor":
-    total = len(item_ids)
+    total_all = len(item_ids)
+    reviewed_all = len(st.session_state.get("reviewed_ids", set()))
+    st.write(f"Total items: **{total_all}** | Reviewed (global): **{reviewed_all}**")
+
+    jobs = st.session_state.get("jobs", [])
+    if not jobs:
+        st.info("Jobs belum terbentuk.")
+        st.stop()
+
+    jobs_per_page = 30
+    if "jobs_page" not in st.session_state:
+        st.session_state.jobs_page = 0
+    pages = max(1, math.ceil(len(jobs) / jobs_per_page))
+    st.session_state.jobs_page = max(0, min(st.session_state.jobs_page, pages - 1))
+
+    cA, cB, cC, cD = st.columns([1, 1, 2, 2])
+    if cA.button("⬅ Prev jobs", disabled=(st.session_state.jobs_page == 0)):
+        st.session_state.jobs_page -= 1
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+        st.rerun()
+    if cB.button("Next jobs ➡", disabled=(st.session_state.jobs_page >= pages - 1)):
+        st.session_state.jobs_page += 1
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+        st.rerun()
+    cC.write(f"Page **{st.session_state.jobs_page+1}** / **{pages}**")
+
+    if cD.button("🧹 Clear Active Job", use_container_width=True):
+        st.session_state.active_job_no = None
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+        st.rerun()
+
+    start = st.session_state.jobs_page * jobs_per_page
+    end = min(start + jobs_per_page, len(jobs))
+    view_jobs = jobs[start:end]
+
+    cols = st.columns(3)
+    for i, job in enumerate(view_jobs):
+        done, tot, pct = job_progress(job, item_ids)
+        acc = job.get("accepted")
+        badge = "⬜"
+        if acc is True:
+            badge = "✅"
+        elif acc is False:
+            badge = "❌"
+
+        label = f"{badge} JOB {job['job_no']} — {done}/{tot} ({pct*100:.0f}%)"
+        col = cols[i % 3]
+        if col.button(label, use_container_width=True, key=f"open_job_{job['job_no']}"):
+            open_job(job["job_no"], item_ids)
+            persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+            st.rerun()
+
+    st.divider()
+
+    if st.button("▶ Resume: buka job pertama yang belum 100%", use_container_width=True):
+        for job in jobs:
+            done, tot, pct = job_progress(job, item_ids)
+            if tot > 0 and done < tot:
+                open_job(job["job_no"], item_ids)
+                persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+                st.rerun()
+                break
+        else:
+            st.success("Semua job sudah 100% direview.")
+    st.stop()
+
+# =====================
+# BATCH EDITOR (mengikuti active_ids)
+# =====================
+if work_view == "Batch Editor":
+    total = len(active_ids)
     pages = (total + batch_size - 1) // batch_size
     st.session_state.page = max(0, min(st.session_state.page, pages - 1))
 
     start = st.session_state.page * batch_size
     end = min(start + batch_size, total)
-    batch_ids = item_ids[start:end]
+    batch_ids = active_ids[start:end]
+
+    job_no = st.session_state.get("active_job_no")
+    if job_no:
+        st.caption(f"Active Job: JOB {job_no} (Batch Editor hanya subset job ini)")
 
     st.subheader(f"Batch Editor ({start+1}-{end} dari {total})")
 
@@ -389,7 +708,8 @@ if review_ui == "Batch Editor":
         data.append(row)
 
     batch_df = pd.DataFrame(data)
-    page_df_key = f"batch_df_page_{st.session_state.page}"
+
+    page_df_key = f"batch_df_activejob_{job_no}_page_{st.session_state.page}"
     if page_df_key not in st.session_state:
         st.session_state[page_df_key] = batch_df
 
@@ -403,7 +723,7 @@ if review_ui == "Batch Editor":
 
     edited = st.data_editor(
         st.session_state[page_df_key],
-        key=f"editor_{st.session_state.page}",
+        key=f"editor_{page_df_key}",
         use_container_width=True,
         hide_index=True,
         column_config=col_cfg,
@@ -414,10 +734,12 @@ if review_ui == "Batch Editor":
 
     if c1.button("⬅ Prev page", disabled=(st.session_state.page == 0)):
         st.session_state.page -= 1
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
     if c2.button("Next page ➡", disabled=(st.session_state.page >= pages - 1)):
         st.session_state.page += 1
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
     if c3.button("💾 Save batch"):
@@ -430,36 +752,40 @@ if review_ui == "Batch Editor":
             if new_intent not in INTENT or new_urg not in URGENCY:
                 continue
             new_ev = [e for e in EVENTS if bool(ed.loc[i, f"EV_{e}"])]
-            if save_change(cid, new_intent, new_urg, new_ev, note="batch_save", reasons=""):
+            qrow = get_queue_row(cid)
+            reasons = (qrow.get("reasons", "") if qrow else "")
+            if save_change(cid, new_intent, new_urg, new_ev, note="batch_save", reasons=reasons):
                 saved += 1
         st.success(f"Saved batch changes: {saved} row(s). Log: {log_path}")
         st.session_state[page_df_key] = ed
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
 
     if c4.button("📦 Export fixed JSONL"):
         write_jsonl(out_fixed_path, rows)
         st.success(f"Export done ✓ → {out_fixed_path}")
         st.info(f"Log: {log_path}")
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
 
     st.stop()
 
-
+# =====================
+# SINGLE REVIEW (center text + right fixed sidebar)
+# =====================
 st.subheader("Single Review (center text fixed + right sidebar)")
 
 RIGHT_W = 420
 RIGHT_GAP = 26
-TOP_OFFSET = 96  
+TOP_OFFSET = 96
 
 st.markdown(
     f"""
     <style>
-    /* Aktif hanya jika anchor ada */
     div[data-testid="stAppViewContainer"]:has(#mzone-right-anchor) div[data-testid="stMainBlockContainer"],
     div[data-testid="stAppViewContainer"]:has(#mzone-right-anchor) section.main > div.block-container,
     div[data-testid="stAppViewContainer"]:has(#mzone-right-anchor) .main .block-container {{
         padding-right: {RIGHT_W + RIGHT_GAP}px !important;
     }}
 
-    /* Kotak text (scroll internal) */
     .mzone-textbox {{
         height: calc(100vh - 260px);
         overflow-y: auto;
@@ -474,7 +800,6 @@ st.markdown(
         width: 100%;
     }}
 
-    /* Sidebar kanan: column yang mengandung anchor */
     div[data-testid="stColumn"]:has(#mzone-right-anchor) {{
         position: fixed !important;
         top: {TOP_OFFSET}px;
@@ -489,12 +814,10 @@ st.markdown(
         z-index: 9999;
     }}
 
-    /* tombol full width */
     div[data-testid="stColumn"]:has(#mzone-right-anchor) button {{
         width: 100%;
     }}
 
-    /* layar kecil fallback (biar tetap kebaca) */
     @media (max-width: 1200px) {{
         div[data-testid="stAppViewContainer"]:has(#mzone-right-anchor) div[data-testid="stMainBlockContainer"],
         div[data-testid="stAppViewContainer"]:has(#mzone-right-anchor) section.main > div.block-container,
@@ -514,13 +837,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
-st.session_state.cursor = max(0, min(st.session_state.cursor, len(item_ids) - 1))
-cur_id = item_ids[st.session_state.cursor]
+# clamp cursor berdasarkan active_ids
+st.session_state.cursor = max(0, min(st.session_state.cursor, len(active_ids) - 1))
+cur_id = active_ids[st.session_state.cursor]
 cur = rows[id2pos[cur_id]]
-qrow = get_queue_row(cur_id)  
+qrow = get_queue_row(cur_id)
 
-
+# init edit state ketika pindah item
 if st.session_state.get("_cur_loaded_id") != cur_id:
     st.session_state._cur_loaded_id = cur_id
     st.session_state.edit_intent = cur.get("intent", INTENT[0]) if cur.get("intent") in INTENT else INTENT[0]
@@ -529,16 +852,15 @@ if st.session_state.get("_cur_loaded_id") != cur_id:
     st.session_state.edit_note = ""
 
 def go_next():
-    st.session_state.cursor = min(st.session_state.cursor + 1, len(item_ids) - 1)
+    st.session_state.cursor = min(st.session_state.cursor + 1, len(active_ids) - 1)
+    st.session_state.edit_note = ""
 
 def go_prev():
     st.session_state.cursor = max(st.session_state.cursor - 1, 0)
+    st.session_state.edit_note = ""
 
-def set_intent(x): 
-    st.session_state.edit_intent = x
-
-def set_urg(x): 
-    st.session_state.edit_urgency = x
+def set_intent(x): st.session_state.edit_intent = x
+def set_urg(x): st.session_state.edit_urgency = x
 
 def toggle_event(ev: str):
     s = set(st.session_state.edit_events)
@@ -574,7 +896,7 @@ def apply_suggestion_to_state(qrow_dict, replace_events=False):
 # Header / progress
 topA, topB, topC, topD = st.columns([1, 2, 3, 2])
 with topA:
-    st.metric("Progress", f"{st.session_state.cursor+1}/{len(item_ids)}")
+    st.metric("Progress", f"{st.session_state.cursor+1}/{len(active_ids)}")
 with topB:
     st.write(f"**id:** `{cur_id}`")
     st.write(f"**idx:** `{cur.get('_idx')}`")
@@ -584,9 +906,10 @@ with topC:
     st.write(f"- urgency: `{cur.get('urgency')}`")
     st.write(f"- events: `{', '.join(stable_row_events(cur))}`")
 with topD:
-    j = st.number_input("Jump to (1-based)", 1, len(item_ids), st.session_state.cursor + 1, 1)
-    if int(j) != (st.session_state.cursor + 1):
-        st.session_state.cursor = int(j) - 1
+    jmp = st.number_input("Jump (1-based)", 1, len(active_ids), st.session_state.cursor + 1, 1)
+    if int(jmp) != (st.session_state.cursor + 1):
+        st.session_state.cursor = int(jmp) - 1
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
 left, right = st.columns([1, 0.001], gap="small")
@@ -601,14 +924,38 @@ with left:
 with right:
     st.markdown("<div id='mzone-right-anchor'></div>", unsafe_allow_html=True)
 
-    st.markdown("### Panel (edit)")
+    # Job header + accept/reject
+    job_no = st.session_state.get("active_job_no")
+    if job_no:
+        st.markdown(f"#### JOB {job_no}")
+        jobs = st.session_state.get("jobs", [])
+        jj = next((x for x in jobs if x["job_no"] == job_no), None)
+        if jj:
+            done, tot, pct = job_progress(jj, item_ids)
+            st.progress(pct)
+            st.caption(f"{done}/{tot} ({pct*100:.1f}%)")
 
+            a1, a2, a3 = st.columns(3)
+            if a1.button("✅ Accept", use_container_width=True):
+                jj["accepted"] = True
+                persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+                st.rerun()
+            if a2.button("❌ Reject", use_container_width=True):
+                jj["accepted"] = False
+                persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+                st.rerun()
+            if a3.button("↩ Back Jobs", use_container_width=True):
+                st.session_state.work_view = "Jobs"
+                persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+                st.rerun()
+        st.divider()
+
+    st.markdown("### Panel (edit)")
     st.caption(f"**Intent:** {st.session_state.edit_intent}")
     st.caption(f"**Urgency:** {st.session_state.edit_urgency}")
     st.caption("**Events:** " + (", ".join(st.session_state.edit_events) if st.session_state.edit_events else "-"))
     st.divider()
 
-    # Quick Intent
     with st.expander("Quick Intent", expanded=True):
         for val in INTENT:
             st.button(
@@ -619,7 +966,6 @@ with right:
                 use_container_width=True,
             )
 
-    # Quick Urgency
     with st.expander("Quick Urgency", expanded=True):
         for val in URGENCY:
             st.button(
@@ -630,7 +976,6 @@ with right:
                 use_container_width=True,
             )
 
-    # Events toggle
     with st.expander("Events (toggle)", expanded=True):
         cL, cR = st.columns(2)
         cols = [cL, cR]
@@ -645,33 +990,41 @@ with right:
 
         if st.button("🧹 Clear events", use_container_width=True, key="clr_events"):
             st.session_state.edit_events = []
+            persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
             st.rerun()
 
     # Queue helper (optional)
-    replace_events = st.checkbox("Replace events when applying suggestion", value=False)
-    if st.button("✨ Apply Suggestions", disabled=(mode != "Queue Review" or not qrow), use_container_width=True):
-        apply_suggestion_to_state(qrow, replace_events=replace_events)
-        st.rerun()
+    if mode == "Queue Review (optional)" and qrow:
+        replace_events = st.checkbox("Replace events when applying suggestion", value=False)
+        if st.button("✨ Apply Suggestions", use_container_width=True):
+            apply_suggestion_to_state(qrow, replace_events=replace_events)
+            persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
+            st.rerun()
 
     if st.button("↩ Undo", use_container_width=True):
         _ = undo_last()
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
     st.divider()
 
-    # Note + Nav
     st.session_state.edit_note = st.text_input("Note (optional)", value=st.session_state.get("edit_note", ""))
 
     r1, r2 = st.columns(2)
     if r1.button("⬅ Prev", use_container_width=True):
         go_prev()
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
+
     if r2.button("✅ Next (Keep)", use_container_width=True):
+        mark_reviewed(cur_id)
         go_next()
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
     r3, r4 = st.columns(2)
     if r3.button("💾 Next (Save)", use_container_width=True):
+        mark_reviewed(cur_id)
         reasons = (qrow.get("reasons", "") if qrow else "")
         _ = save_change(
             cur_id,
@@ -682,10 +1035,12 @@ with right:
             reasons=reasons,
         )
         go_next()
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
     if r4.button("📦 Export fixed JSONL", use_container_width=True):
         write_jsonl(out_fixed_path, rows)
         st.success(f"Export done ✓ → {out_fixed_path}")
         st.info(f"Log: {log_path}")
+        persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.stop()

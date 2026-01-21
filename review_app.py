@@ -344,15 +344,86 @@ def open_job(job_no: int, all_ids: list):
 
     st.session_state.cursor = idx
     st.session_state._cur_loaded_id = None
-    st.session_state.work_view = "Single Review"
+    st.session_state.nav_to = "Single Review"
 
 # =====================
 # App UI
 # =====================
 st.set_page_config(page_title="MZone Dataset Review", layout="wide")
-st.title("MZone Dataset Review — Jobs / Single / Batch")
+# st.title("MZone Dataset Review — Jobs / Single / Batch")
+
+# =====================
+# GLOBAL FONT / TEXT SIZE (ubah di sini)
+# =====================
+BASE_FONT_PX = 14        # ukuran default semua teks
+SMALL_FONT_PX = 14       # caption/helper kecil
+H1_PX = 30               # st.title
+H2_PX = 22               # st.header / st.subheader
+H3_PX = 14               # label widget / expander title
+BTN_PX = 12              # tombol
+SIDEBAR_PX = 12          # teks sidebar
+
+st.markdown(f"""
+<style>
+/* 1) DEFAULT seluruh app */
+html, body, [class*="css"] {{
+  font-size: {BASE_FONT_PX}px !important;
+}}
+
+/* 2) Sidebar */
+section[data-testid="stSidebar"] * {{
+  font-size: {SIDEBAR_PX}px !important;
+}}
+
+/* 3) Title / Header / Subheader */
+h1 {{
+  font-size: {H1_PX}px !important;
+}}
+h2 {{
+  font-size: {H2_PX}px !important;
+}}
+h3 {{
+  font-size: {H3_PX}px !important;
+}}
+
+/* 4) Caption, help text, small text */
+small, .stCaption, [data-testid="stCaptionContainer"] * {{
+  font-size: {SMALL_FONT_PX}px !important;
+}}
+
+/* 5) Label widget (selectbox, radio, checkbox, text_input, dll) */
+label, [data-testid="stWidgetLabel"] * {{
+  font-size: {H3_PX}px !important;
+}}
+
+/* 6) Button text */
+button, button * {{
+  font-size: {BTN_PX}px !important;
+}}
+
+/* 7) Data editor / tabel */
+[data-testid="stDataFrame"] *, [data-testid="stTable"] * {{
+  font-size: {BASE_FONT_PX}px !important;
+}}
+
+/* 8) Text area (yang kamu buat untuk review text) */
+.mzone-textbox {{
+  font-size: {BASE_FONT_PX}px !important;
+  line-height: 1.5 !important;
+}}
+</style>
+""", unsafe_allow_html=True)
+
 
 require_login()
+
+if "nav_to" not in st.session_state:
+    st.session_state.nav_to = None
+
+# kalau ada permintaan pindah halaman (dari button click sebelumnya)
+if st.session_state.nav_to:
+    st.session_state.work_view_sel = st.session_state.nav_to
+    st.session_state.nav_to = None
 
 # ---- Sidebar: paths dulu
 with st.sidebar:
@@ -388,7 +459,7 @@ with st.sidebar:
         "Pilih halaman",
         ["Jobs", "Single Review", "Batch Editor"],
         index=0,
-        key="work_view"
+        key="work_view_sel"
     )
 
     st.divider()
@@ -535,10 +606,10 @@ with st.sidebar:
 
 
     cS1, cS2 = st.columns(2)
-    if cS1.button("💾 Save state", use_container_width=True):
+    if cS1.button("💾 Save", use_container_width=True):
         persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.success("State saved.")
-    if cS2.button("♻ Reset state", use_container_width=True):
+    if cS2.button("♻ Reset", use_container_width=True):
         reset_state(state_path, cur_dataset_sig, cur_job_sig)
         st.warning("State reset.")
         st.rerun()
@@ -742,7 +813,7 @@ if work_view == "Batch Editor":
         persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
-    if c3.button("💾 Save batch"):
+    if c3.button("💾"):
         ed = edited.copy()
         saved = 0
         for i in range(len(ed)):
@@ -771,11 +842,11 @@ if work_view == "Batch Editor":
 # =====================
 # SINGLE REVIEW (center text + right fixed sidebar)
 # =====================
-st.subheader("Single Review (center text fixed + right sidebar)")
+# st.subheader("Single Review (center text fixed + right sidebar)")
 
-RIGHT_W = 420
-RIGHT_GAP = 26
-TOP_OFFSET = 96
+RIGHT_W = 330
+RIGHT_GAP = 10
+TOP_OFFSET = 75
 
 st.markdown(
     f"""
@@ -787,7 +858,7 @@ st.markdown(
     }}
 
     .mzone-textbox {{
-        height: calc(100vh - 260px);
+        height: calc(100vh - 300px);
         overflow-y: auto;
         padding: 14px 16px;
         border: 1px solid rgba(49, 51, 63, 0.20);
@@ -944,8 +1015,8 @@ with right:
                 jj["accepted"] = False
                 persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
                 st.rerun()
-            if a3.button("↩ Back Jobs", use_container_width=True):
-                st.session_state.work_view = "Jobs"
+            if a3.button("↩ Jobs", use_container_width=True):
+                st.session_state.nav_to = "Jobs"
                 persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
                 st.rerun()
         st.divider()
@@ -977,11 +1048,9 @@ with right:
             )
 
     with st.expander("Events (toggle)", expanded=True):
-        cL, cR = st.columns(2)
-        cols = [cL, cR]
-        for i, ev in enumerate(EVENTS):
-            cols[i % 2].button(
-                mark(ev in st.session_state.edit_events, ev),
+        for ev in EVENTS:
+            st.button(
+                ("✅ " if ev in st.session_state.edit_events else "⬜ ") + ev,
                 key=f"qe_{ev}",
                 on_click=toggle_event,
                 args=(ev,),
@@ -990,7 +1059,6 @@ with right:
 
         if st.button("🧹 Clear events", use_container_width=True, key="clr_events"):
             st.session_state.edit_events = []
-            persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
             st.rerun()
 
     # Queue helper (optional)
@@ -1011,19 +1079,19 @@ with right:
     st.session_state.edit_note = st.text_input("Note (optional)", value=st.session_state.get("edit_note", ""))
 
     r1, r2 = st.columns(2)
-    if r1.button("⬅ Prev", use_container_width=True):
+    if r1.button("⬅", use_container_width=True):
         go_prev()
         persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
-    if r2.button("✅ Next (Keep)", use_container_width=True):
+    if r2.button("➡", use_container_width=True):
         mark_reviewed(cur_id)
         go_next()
         persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
     r3, r4 = st.columns(2)
-    if r3.button("💾 Next (Save)", use_container_width=True):
+    if r3.button("💾", use_container_width=True):
         mark_reviewed(cur_id)
         reasons = (qrow.get("reasons", "") if qrow else "")
         _ = save_change(
@@ -1038,7 +1106,7 @@ with right:
         persist_state_now(state_path, cur_dataset_sig, cur_job_sig)
         st.rerun()
 
-    if r4.button("📦 Export fixed JSONL", use_container_width=True):
+    if r4.button("📦", use_container_width=True):
         write_jsonl(out_fixed_path, rows)
         st.success(f"Export done ✓ → {out_fixed_path}")
         st.info(f"Log: {log_path}")

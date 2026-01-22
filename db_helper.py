@@ -1,27 +1,113 @@
+# db_helper.py
 import os
+import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse, parse_qs
 
 ALLOWED_TABLES = {"dataset_train", "dataset_val", "dataset_test"}
-
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME", "mzone_dataset")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", os.getenv("DB_PASSWORD", ""))
 
 # cache sederhana untuk info kolom per table
 _TABLE_INFO_CACHE = {}
 
+# cache config DB (biar gak parse berulang)
+_DB_CFG_CACHE = None
+
+
+def _get_secret(key: str, default=None):
+    """
+    Ambil dari st.secrets jika tersedia (Streamlit Cloud),
+    fallback ke environment variables (lokal).
+    """
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return st.secrets.get(key, default)
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+
+def _load_db_cfg() -> dict:
+    """
+    Return dict config:
+      host, port, dbname, user, password, sslmode, connect_timeout
+    Support DATABASE_URL / DB_URL.
+    """
+    global _DB_CFG_CACHE
+    if _DB_CFG_CACHE is not None:
+        return _DB_CFG_CACHE
+
+    # 1) DATABASE_URL (paling enak untuk deploy)
+    db_url = _get_secret("DATABASE_URL", None) or _get_secret("DB_URL", None)
+    if db_url:
+        u = urlparse(db_url)
+        q = parse_qs(u.query or "")
+
+        # sslmode dari query url kalau ada, else dari secrets/env, else require (umumnya cloud butuh)
+        sslmode = (q.get("sslmode", [None])[0] or _get_secret("DB_SSLMODE", None) or "require")
+
+        cfg = {
+            "host": u.hostname or "",
+            "port": int(u.port or 5432),
+            "dbname": (u.path or "").lstrip("/") or "",
+            "user": u.username or "",
+            "password": u.password or "",
+            "sslmode": sslmode,
+            "connect_timeout": int(_get_secret("DB_CONNECT_TIMEOUT", "10")),
+        }
+        _DB_CFG_CACHE = cfg
+        return cfg
+
+    # 2) Split fields
+    host = _get_secret("DB_HOST", "localhost")
+    port = int(_get_secret("DB_PORT", "5432"))
+    dbname = _get_secret("DB_NAME", "mzone_dataset")
+    user = _get_secret("DB_USER", "postgres")
+
+    # Support DB_PASSWORD / DB_PASS
+    password = _get_secret("DB_PASSWORD", None)
+    if password is None:
+        password = _get_secret("DB_PASS", "")
+
+    # SSL default "prefer" biar aman buat lokal (SSL kalau ada)
+    sslmode = _get_secret("DB_SSLMODE", "prefer")
+    connect_timeout = int(_get_secret("DB_CONNECT_TIMEOUT", "10"))
+
+    cfg = {
+        "host": host,
+        "port": port,
+        "dbname": dbname,
+        "user": user,
+        "password": password,
+        "sslmode": sslmode,
+        "connect_timeout": connect_timeout,
+    }
+    _DB_CFG_CACHE = cfg
+    return cfg
+
 
 def get_connection():
+    cfg = _load_db_cfg()
+
+    # Validasi biar error deploy lebih jelas
+    missing = [k for k in ["host", "dbname", "user", "password"] if not cfg.get(k)]
+    if missing:
+        raise RuntimeError(
+            f"DB config missing {missing}. "
+            f"Isi Secrets/ENV: DB_HOST, DB_NAME, DB_USER, DB_PASSWORD (atau DATABASE_URL)."
+        )
+
     return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
+        host=cfg["host"],
+        port=cfg["port"],
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
+        sslmode=cfg.get("sslmode", "prefer"),
+        connect_timeout=cfg.get("connect_timeout", 10),
         cursor_factory=RealDictCursor,
+        application_name="mzone-dataset-review",
     )
 
 

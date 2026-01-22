@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: mzone_postgres
+    environment:
+      POSTGRES_DB: mzone_dataset
+      POSTGRES_USER: mzone
+      POSTGRES_PASSWORD: mzone_pass_change
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

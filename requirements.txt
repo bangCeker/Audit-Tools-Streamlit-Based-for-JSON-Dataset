@@ -1,2 +1,12 @@
-streamlit 
-pandas
+# requirements.txt
+# Dependencies untuk MZone Dataset Review App dengan PostgreSQL
+
+# Core dependencies
+streamlit>=1.28.0
+pandas>=2.0.0
+
+# PostgreSQL database
+psycopg2-binary>=2.9.9
+
+# Optional: untuk environment variable management
+python-dotenv>=1.0.0
